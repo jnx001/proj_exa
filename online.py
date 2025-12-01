@@ -5,19 +5,75 @@ import hashlib
 import pandas as pd
 from datetime import datetime
 
+# try optional fallback driver
+try:
+    import pymysql
+except Exception:
+    pymysql = None
+
+# Connection wrapper so existing code can call conn.cursor(dictionary=True)
+class _ConnWrapper:
+    def __init__(self, conn, is_pymysql=False):
+        self._conn = conn
+        self._is_pymysql = is_pymysql
+
+    def cursor(self, dictionary=False):
+        if self._is_pymysql:
+            # return a PyMySQL DictCursor when dictionary=True
+            return self._conn.cursor(pymysql.cursors.DictCursor if dictionary else None)
+        else:
+            return self._conn.cursor(dictionary=dictionary)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def close(self):
+        return self._conn.close()
+
+# Safe rerun helper (works across Streamlit versions)
+def safe_rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+    else:
+        # As a last resort stop execution and ask user to refresh
+        st.stop()
+
 # Database connection
 def create_connection():
+    """Try mysql-connector (with mysql_native_password). If it fails due to
+    caching_sha2_password, fall back to PyMySQL (install with `pip install PyMySQL`)."""
     try:
-        connection = mysql.connector.connect(
+        conn = mysql.connector.connect(
             host='localhost',
             database='online_exam',
             user='root',
-            password='juned6504'  # Change this
+            password='juned6504',
+            auth_plugin='mysql_native_password',
+            use_pure=True
         )
-        return connection
-    except Error as e:
-        st.error(f"Error connecting to MySQL: {e}")
-        return None
+        return _ConnWrapper(conn, is_pymysql=False)
+    except Exception as e:
+        err = str(e)
+        # If connector doesn't support caching_sha2_password try PyMySQL fallback
+        if ('caching_sha2_password' in err or 'Authentication plugin' in err) and pymysql:
+            try:
+                pconn = pymysql.connect(
+                    host='localhost',
+                    user='root',
+                    password='juned6504',
+                    db='online_exam',
+                    cursorclass=pymysql.cursors.DictCursor,
+                    autocommit=False
+                )
+                return _ConnWrapper(pconn, is_pymysql=True)
+            except Exception as e2:
+                st.error(f"Fallback PyMySQL connection failed: {e2}")
+                return None
+        else:
+            st.error(f"Error connecting to MySQL: {e}")
+            return None
 
 # Initialize database tables
 def init_database():
@@ -258,14 +314,28 @@ def check_exam_taken(student_id, exam_id):
     conn = create_connection()
     if conn:
         cursor = conn.cursor()
+        # return a named column so dict-cursors have a predictable key
         cursor.execute(
-            "SELECT COUNT(*) FROM results WHERE student_id=%s AND exam_id=%s",
+            "SELECT COUNT(*) AS cnt FROM results WHERE student_id=%s AND exam_id=%s",
             (student_id, exam_id)
         )
-        count = cursor.fetchone()[0]
+        row = cursor.fetchone()
         cursor.close()
         conn.close()
-        return count > 0
+        if not row:
+            return False
+        # handle both dict (PyMySQL / dict-cursor) and tuple results
+        if isinstance(row, dict):
+            count = row.get('cnt', None)
+            if count is None:
+                # fallback to first value
+                count = next(iter(row.values()))
+        else:
+            count = row[0]
+        try:
+            return int(count) > 0
+        except Exception:
+            return False
     return False
 
 # Initialize session state
@@ -302,7 +372,7 @@ def login_page():
         for k in ['logged_in', 'user_type', 'user_data', 'exam_started', 'current_exam', 'current_exam_id', 'question_list']:
             if k in st.session_state:
                 del st.session_state[k]
-        st.experimental_rerun()
+        safe_rerun()
     
     # Create tabs for login and registration
     tab1, tab2, tab3 = st.tabs(["👨‍💼 Admin Login", "🎓 Student Login", "📝 Student Registration"])
